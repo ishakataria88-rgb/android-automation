@@ -6,6 +6,7 @@ from pathlib import Path
 import csv
 from datetime import datetime
 import shutil
+import os
 from apk_inspect import get_apk_info
 
 # --- CONFIG ---
@@ -20,6 +21,108 @@ password = "Tester@123"
 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 log_file = apk_folder / f"apk_run_{ts}.log"
 csv_file = apk_folder / f"apk_results.csv"
+adobe_net_log_file = apk_folder / f"adobe_network_{ts}.log"
+
+# --- NETWORK MONITOR (mitmproxy over ADB reverse) ---
+mitm_proc = None
+
+def start_adobe_network_monitor():
+    """Start mitmdump and route device HTTP(S) traffic via USB to capture mh.adobe.io only.
+
+    Requirements (one-time on host/device):
+      - Install mitmproxy on the host (pip install mitmproxy)
+      - On the device, install the mitmproxy CA: open http://mitm.it and install Android CA
+    """
+    global mitm_proc
+    try:
+        # Prepare tiny mitm addon that logs only mh.adobe.io
+        addon_path = apk_folder / "mitm_adobe_logger.py"
+        addon_code = (
+            "from mitmproxy import http\n"
+            "def request(flow: http.HTTPFlow):\n"
+            "    if 'mh.adobe.io' in flow.request.host:\n"
+            "        print(f'[ADOBE REQUEST] {flow.request.method} {flow.request.pretty_url}')\n"
+            "def response(flow: http.HTTPFlow):\n"
+            "    if 'mh.adobe.io' in flow.request.host:\n"
+            "        status = flow.response.status_code if flow.response else 'NA'\n"
+            "        print(f'[ADOBE RESPONSE] {status} {flow.request.pretty_url}')\n"
+        )
+        try:
+            with open(addon_path, "w", encoding="utf-8") as f:
+                f.write(addon_code)
+        except Exception as e:
+            log_msg(f"⚠️ Could not write mitm addon: {e}")
+
+        # Start mitmdump on host:8080
+        with open(adobe_net_log_file, "a", encoding="utf-8") as lf:
+            lf.write(f"\n===== Starting mitmdump at {datetime.now().isoformat()} =====\n")
+
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        try:
+            mitm_cmd = [
+                "mitmdump",
+                "-p", "8080",
+                "--set", "block_global=false",
+                "--ssl-insecure",
+                "-s", str(addon_path)
+            ]
+            mitm_proc_local = subprocess.Popen(
+                mitm_cmd,
+                stdout=open(adobe_net_log_file, "a", encoding="utf-8"),
+                stderr=subprocess.STDOUT,
+                env=env
+            )
+            mitm_proc = mitm_proc_local
+        except FileNotFoundError:
+            log_msg("❌ mitmdump not found. Install mitmproxy: pip install mitmproxy")
+            mitm_proc = None
+            return
+
+        time.sleep(2)
+
+        # Forward device localhost:8080 to host:8080 and set global proxy on device
+        try:
+            subprocess.run([adb_path, "reverse", "tcp:8080", "tcp:8080"], check=False)
+        except Exception as e:
+            log_msg(f"⚠️ adb reverse failed: {e}")
+
+        try:
+            subprocess.run([adb_path, "shell", "settings", "put", "global", "http_proxy", "127.0.0.1:8080"], check=False)
+            log_msg("🌐 Device proxy set to 127.0.0.1:8080 via ADB. If first run, install CA at http://mitm.it on device.")
+        except Exception as e:
+            log_msg(f"⚠️ Failed to set device proxy: {e}")
+    except Exception as e:
+        log_msg(f"⚠️ start_adobe_network_monitor error: {e}")
+
+def stop_adobe_network_monitor():
+    """Stop mitmdump and clear device proxy/port reverse."""
+    global mitm_proc
+    try:
+        try:
+            subprocess.run([adb_path, "shell", "settings", "put", "global", "http_proxy", ":0"], check=False)
+        except Exception as e:
+            log_msg(f"⚠️ Could not clear device proxy: {e}")
+
+        try:
+            subprocess.run([adb_path, "reverse", "--remove", "tcp:8080"], check=False)
+        except Exception:
+            pass
+
+        if mitm_proc is not None and mitm_proc.poll() is None:
+            try:
+                mitm_proc.terminate()
+                try:
+                    mitm_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    mitm_proc.kill()
+            except Exception:
+                pass
+        mitm_proc = None
+        with open(adobe_net_log_file, "a", encoding="utf-8") as lf:
+            lf.write(f"===== Stopped mitmdump at {datetime.now().isoformat()} =====\n")
+    except Exception as e:
+        log_msg(f"⚠️ stop_adobe_network_monitor error: {e}")
 
 # --- DEVICE CONNECTION ---
 d = u2.connect()
@@ -278,13 +381,19 @@ for apk_file in apk_folder.glob("*.apk"):
         continue
 
     # --- LAUNCH APP ---
+    monitor_started = False
     try:
+        # Start network monitor just before app launch to capture earliest calls
+        start_adobe_network_monitor()
+        monitor_started = True
         d.app_start(package_name, wait=True)
         time.sleep(6)
         handle_popups()
     except Exception as e:
         log_msg(f"❌ Failed to launch app: {e}")
         final_status = "Failed to install"
+        if monitor_started:
+            stop_adobe_network_monitor()
         continue
 
     # --- LOGIN ---
@@ -325,6 +434,10 @@ for apk_file in apk_folder.glob("*.apk"):
             hash_info["pub_key_hash"], hash_info["certificate_v2"], hash_info["google_hash"],
             hash_info["classes_dex_hash"], hash_info["all_dex_hash"], hash_info["md5"]
         ])
+
+    # --- STOP NETWORK MONITOR ---
+    if monitor_started:
+        stop_adobe_network_monitor()
 
     # --- UNINSTALL APK ---
     subprocess.run([adb_path, "uninstall", package_name])
