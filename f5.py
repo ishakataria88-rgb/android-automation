@@ -8,6 +8,12 @@ from datetime import datetime
 import shutil
 import os
 from apk_inspect import get_apk_info
+import json
+import re
+try:
+    import frida  # optional, for in-app plaintext capture before encryption
+except Exception:
+    frida = None
 
 # --- CONFIG ---
 apk_folder = Path(r"C:\Users\sranjan\Desktop\APK_final\downloaded_files")
@@ -25,6 +31,9 @@ adobe_net_log_file = apk_folder / f"adobe_network_{ts}.log"
 
 # --- NETWORK MONITOR (mitmproxy over ADB reverse) ---
 mitm_proc = None
+frida_session = None
+frida_script = None
+frida_plain_json = None
 
 def start_adobe_network_monitor():
     """Start mitmdump and route device HTTP(S) traffic via USB to capture mh.adobe.io only.
@@ -39,13 +48,49 @@ def start_adobe_network_monitor():
         addon_path = apk_folder / "mitm_adobe_logger.py"
         addon_code = (
             "from mitmproxy import http\n"
+            "import json\n"
+            "\n"
+            "def _emit(prefix: str, data):\n"
+            "    try:\n"
+            "        print(prefix + json.dumps(data, ensure_ascii=False))\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "\n"
             "def request(flow: http.HTTPFlow):\n"
             "    if 'mh.adobe.io' in flow.request.host:\n"
-            "        print(f'[ADOBE REQUEST] {flow.request.method} {flow.request.pretty_url}')\n"
+            "        raw = None\n"
+            "        try:\n"
+            "            raw = flow.request.get_text(strict=False)\n"
+            "        except Exception:\n"
+            "            raw = None\n"
+            "        if raw:\n"
+            "            s = raw.strip()\n"
+            "            if s.startswith('{'):\n"
+            "                try:\n"
+            "                    obj = json.loads(s)\n"
+            "                    if isinstance(obj, dict) and 'key' in obj and 'payload' in obj:\n"
+            "                        _emit('ENC_REQ:', obj)\n"
+            "                    elif isinstance(obj, dict):\n"
+            "                        _emit('JSON_REQ:', obj)\n"
+            "                except Exception:\n"
+            "                    pass\n"
+            "\n"
             "def response(flow: http.HTTPFlow):\n"
-            "    if 'mh.adobe.io' in flow.request.host:\n"
-            "        status = flow.response.status_code if flow.response else 'NA'\n"
-            "        print(f'[ADOBE RESPONSE] {status} {flow.request.pretty_url}')\n"
+            "    if 'mh.adobe.io' in flow.request.host and flow.response is not None:\n"
+            "        raw = None\n"
+            "        try:\n"
+            "            raw = flow.response.get_text(strict=False)\n"
+            "        except Exception:\n"
+            "            raw = None\n"
+            "        if raw:\n"
+            "            s = raw.strip()\n"
+            "            if s.startswith('{'):\n"
+            "                try:\n"
+            "                    obj = json.loads(s)\n"
+            "                    if isinstance(obj, dict):\n"
+            "                        _emit('JSON_RESP:', obj)\n"
+            "                except Exception:\n"
+            "                    pass\n"
         )
         try:
             with open(addon_path, "w", encoding="utf-8") as f:
@@ -124,6 +169,161 @@ def stop_adobe_network_monitor():
     except Exception as e:
         log_msg(f"⚠️ stop_adobe_network_monitor error: {e}")
 
+# --- FRIDA PLAINTEXT SNIFFER ---
+def start_frida_plaintext_sniffer(package_name: str):
+    """Attach a Frida script to capture plaintext JSON before app-level encryption.
+
+    Requires frida-tools on host (pip install frida-tools frida) and frida-server running on device.
+    """
+    global frida_session, frida_script, frida_plain_json
+    frida_plain_json = None
+    if frida is None:
+        log_msg("ℹ️ Frida not available on host. Skipping plaintext sniffer.")
+        return False
+    try:
+        # Resolve PID via adb
+        pid = None
+        try:
+            out = subprocess.check_output([adb_path, "shell", "pidof", package_name], stderr=subprocess.DEVNULL)
+            pid_str = out.decode("utf-8", errors="ignore").strip()
+            if pid_str:
+                # pidof may return multiple pids; take the first
+                pid = int(pid_str.split()[0])
+        except Exception:
+            pid = None
+
+        device = frida.get_usb_device(timeout=5)
+        if pid is None:
+            # attempt by name
+            for app in device.enumerate_processes():
+                if app.name == package_name:
+                    pid = app.pid
+                    break
+        if pid is None:
+            log_msg("⚠️ Could not find app PID for Frida attach.")
+            return False
+
+        frida_session = device.attach(pid)
+
+        script_source = r"""
+            Java.perform(function() {
+                try {
+                    var Cipher = Java.use('javax.crypto.Cipher');
+                    var StringCls = Java.use('java.lang.String');
+                    var HashMap = {};
+                    var ENCRYPT_MODE = 1;
+
+                    function setMode(thiz, mode) {
+                        try { HashMap[thiz.$h] = mode; } catch (e) {}
+                    }
+                    function getMode(thiz) {
+                        try { return HashMap[thiz.$h]; } catch (e) { return undefined; }
+                    }
+
+                    // Hook init variants to remember opmode
+                    if (Cipher.init.overloads) {
+                        Cipher.init.overloads.forEach(function(ov) {
+                            ov.implementation = function() {
+                                try { setMode(this, arguments[0]); } catch (e) {}
+                                return ov.apply(this, arguments);
+                            };
+                        });
+                    }
+
+                    function tryDecode(bytes) {
+                        try {
+                            var s = StringCls.$new(bytes, 'UTF-8').toString();
+                            return s;
+                        } catch (e) { return null; }
+                    }
+
+                    function maybeSend(jsonStr) {
+                        try {
+                            if (!jsonStr) return;
+                            if (jsonStr.charAt(0) !== '{') return;
+                            if (jsonStr.indexOf('deviceGuid') === -1 && jsonStr.indexOf('sessionGuid') === -1) return;
+                            send({ type: 'adobe_plain', json: jsonStr });
+                        } catch (e) {}
+                    }
+
+                    // doFinal(byte[]) overloads
+                    if (Cipher.doFinal.overloads) {
+                        Cipher.doFinal.overloads.forEach(function(ov) {
+                            var m = ov.returnType && ov.argumentTypes ? ov : null;
+                            ov.implementation = function() {
+                                var mode = getMode(this);
+                                if (mode === ENCRYPT_MODE) {
+                                    try {
+                                        // common forms: doFinal(byte[]) or doFinal(byte[], int)
+                                        if (arguments.length > 0) {
+                                            var candidate = null;
+                                            for (var i = 0; i < arguments.length; i++) {
+                                                if (arguments[i] && arguments[i].$className === 'byte[]') { candidate = arguments[i]; break; }
+                                            }
+                                            if (candidate) {
+                                                var s = tryDecode(candidate);
+                                                maybeSend(s);
+                                            }
+                                        }
+                                    } catch (e) {}
+                                }
+                                return ov.apply(this, arguments);
+                            };
+                        });
+                    }
+                } catch (e) {
+                    send({ type: 'frida_error', error: e.toString() });
+                }
+            });
+        """
+
+        def on_message(message, data):
+            nonlocal package_name
+            global frida_plain_json
+            try:
+                if message.get("type") == "send":
+                    payload = message.get("payload") or {}
+                    if isinstance(payload, dict) and payload.get("type") == "adobe_plain":
+                        js = payload.get("json", "")
+                        # store first occurrence only
+                        if js and frida_plain_json is None:
+                            frida_plain_json = js
+                            try:
+                                with open(adobe_net_log_file, "a", encoding="utf-8") as lf:
+                                    lf.write("FRIDA_PLAINTEXT:" + js + "\n")
+                            except Exception:
+                                pass
+                elif message.get("type") == "error":
+                    log_msg(f"⚠️ Frida script error: {message}")
+            except Exception as e:
+                log_msg(f"⚠️ Frida on_message exception: {e}")
+
+        frida_script = frida_session.create_script(script_source)
+        frida_script.on("message", on_message)
+        frida_script.load()
+        log_msg("✅ Frida plaintext sniffer attached.")
+        return True
+    except Exception as e:
+        log_msg(f"⚠️ Frida attach failed: {e}")
+        return False
+
+def stop_frida_plaintext_sniffer():
+    global frida_session, frida_script
+    try:
+        if frida_script is not None:
+            try:
+                frida_script.unload()
+            except Exception:
+                pass
+        if frida_session is not None:
+            try:
+                frida_session.detach()
+            except Exception:
+                pass
+    finally:
+        frida_session = None
+        frida_script = None
+
 # --- DEVICE CONNECTION ---
 d = u2.connect()
 def log_msg(msg):
@@ -142,7 +342,14 @@ with open(csv_file, "w", newline="", encoding="utf-8") as f:
         "Version", "Product", "Package Name",
         "icmobile_pkg", "libmyapp_so",
         "PubKeyHash", "CertificateV2", "GoogleHash", "Classes.dex",
-        "All Dex Hash", "MD5"
+        "All Dex Hash", "MD5",
+        # Adobe network fields (plaintext if available, else blank). Encrypted always captured if seen
+        "adobe_deviceGuid", "adobe_userGuid", "adobe_countryCode", "adobe_appName",
+        "adobe_appId", "adobe_appVersion", "adobe_ecid", "adobe_appVersionMH",
+        "adobe_imsAPIKey", "adobe_sessionGuid", "adobe_systemManufacturer",
+        "adobe_systemModel", "adobe_userTimeZone", "adobe_osVersion", "adobe_osLocale",
+        "adobe_mhLibVersion", "adobe_stateName", "adobe_hca", "adobe_hcl", "adobe_ham",
+        "adobe_enc_key_b64", "adobe_enc_payload_b64"
     ])
 
 # --- POPUP HANDLER ---
@@ -355,6 +562,16 @@ for apk_file in apk_folder.glob("*.apk"):
     final_status = "Failed to install"
     installed_from_play = "No"
     paywall_after_play = "No"
+    # Adobe fields defaults per APK run
+    adobe_plain = {
+        "deviceGuid": "", "userGuid": "", "countryCode": "", "appName": "",
+        "appId": "", "appVersion": "", "ecid": "", "appVersionMH": "",
+        "imsAPIKey": "", "sessionGuid": "", "systemManufacturer": "",
+        "systemModel": "", "userTimeZone": "", "osVersion": "", "osLocale": "",
+        "mhLibVersion": "", "stateName": "", "hca": "", "hcl": "", "ham": ""
+    }
+    adobe_enc_key_b64 = ""
+    adobe_enc_payload_b64 = ""
 
     # --- APK INFO ---
     try:
@@ -382,11 +599,19 @@ for apk_file in apk_folder.glob("*.apk"):
 
     # --- LAUNCH APP ---
     monitor_started = False
+    log_start_offset = 0
     try:
         # Start network monitor just before app launch to capture earliest calls
+        try:
+            if adobe_net_log_file.exists():
+                log_start_offset = adobe_net_log_file.stat().st_size
+        except Exception:
+            log_start_offset = 0
         start_adobe_network_monitor()
         monitor_started = True
         d.app_start(package_name, wait=True)
+        # Attempt to attach Frida after app start
+        start_frida_plaintext_sniffer(package_name)
         time.sleep(6)
         handle_popups()
     except Exception as e:
@@ -394,6 +619,7 @@ for apk_file in apk_folder.glob("*.apk"):
         final_status = "Failed to install"
         if monitor_started:
             stop_adobe_network_monitor()
+        stop_frida_plaintext_sniffer()
         continue
 
     # --- LOGIN ---
@@ -423,6 +649,95 @@ for apk_file in apk_folder.glob("*.apk"):
         final_status = "Failed to install"
 
 
+    # --- STOP NETWORK MONITOR & PARSE LOG ---
+    if monitor_started:
+        stop_adobe_network_monitor()
+    stop_frida_plaintext_sniffer()
+        # Parse only the new part of the log for this APK run
+        try:
+            def _flatten_adobe_json(obj: dict):
+                out = dict(adobe_plain)
+                try:
+                    out.update({
+                        "deviceGuid": obj.get("deviceGuid", ""),
+                        "userGuid": obj.get("userGuid", ""),
+                        "countryCode": obj.get("countryCode", ""),
+                        "appName": obj.get("appName", ""),
+                        "appId": obj.get("appId", ""),
+                        "appVersion": obj.get("appVersion", ""),
+                        "ecid": obj.get("ecid", ""),
+                        "appVersionMH": obj.get("appVersionMH", ""),
+                        "imsAPIKey": obj.get("imsAPIKey", ""),
+                        "sessionGuid": obj.get("sessionGuid", ""),
+                        "systemManufacturer": obj.get("systemManufacturer", ""),
+                        "systemModel": obj.get("systemModel", ""),
+                        "userTimeZone": obj.get("userTimeZone", ""),
+                        "osVersion": obj.get("osVersion", ""),
+                        "osLocale": obj.get("osLocale", ""),
+                        "mhLibVersion": obj.get("mhLibVersion", "")
+                    })
+                    state_list = obj.get("mAppStateList") or obj.get("appStateList") or []
+                    if isinstance(state_list, list) and len(state_list) > 0:
+                        state0 = state_list[0] or {}
+                        out["stateName"] = state0.get("stateName", "")
+                        svi = state0.get("stateValueInfo") or {}
+                        out["hca"] = svi.get("hca", "")
+                        out["hcl"] = svi.get("hcl", "")
+                        out["ham"] = svi.get("ham", "")
+                except Exception:
+                    pass
+                return out
+
+            enc_key = ""
+            enc_payload = ""
+            plain_found = False
+            # Read only the appended part of the file
+            with open(adobe_net_log_file, "r", encoding="utf-8", errors="ignore") as lf:
+                try:
+                    lf.seek(log_start_offset)
+                except Exception:
+                    pass
+                for line in lf:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("FRIDA_PLAINTEXT:"):
+                        try:
+                            json_str = line.split(":", 1)[1]
+                            obj = json.loads(json_str)
+                            tmp = _flatten_adobe_json(obj)
+                            if tmp.get("deviceGuid") or tmp.get("sessionGuid"):
+                                adobe_plain = tmp
+                                plain_found = True
+                        except Exception:
+                            pass
+                    if line.startswith("JSON_REQ:") or line.startswith("JSON_RESP:"):
+                        try:
+                            json_str = line.split(":", 1)[1]
+                            obj = json.loads(json_str)
+                            tmp = _flatten_adobe_json(obj)
+                            # Consider it found if at least deviceGuid and sessionGuid exist
+                            if tmp.get("deviceGuid") or tmp.get("sessionGuid"):
+                                adobe_plain = tmp
+                                plain_found = True
+                        except Exception:
+                            pass
+                    elif line.startswith("ENC_REQ:"):
+                        try:
+                            json_str = line.split(":", 1)[1]
+                            obj = json.loads(json_str)
+                            if isinstance(obj, dict):
+                                enc_key = obj.get("key", enc_key)
+                                enc_payload = obj.get("payload", enc_payload)
+                        except Exception:
+                            pass
+            if enc_key:
+                adobe_enc_key_b64 = enc_key.strip()
+            if enc_payload:
+                adobe_enc_payload_b64 = enc_payload.strip()
+        except Exception as e:
+            log_msg(f"⚠️ Failed parsing adobe network log: {e}")
+
     # --- WRITE TO CSV ---
     with open(csv_file, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -432,12 +747,14 @@ for apk_file in apk_folder.glob("*.apk"):
             version, product, package_name,
             icmobile_pkg, libmyapp_so,
             hash_info["pub_key_hash"], hash_info["certificate_v2"], hash_info["google_hash"],
-            hash_info["classes_dex_hash"], hash_info["all_dex_hash"], hash_info["md5"]
+            hash_info["classes_dex_hash"], hash_info["all_dex_hash"], hash_info["md5"],
+            adobe_plain["deviceGuid"], adobe_plain["userGuid"], adobe_plain["countryCode"], adobe_plain["appName"],
+            adobe_plain["appId"], adobe_plain["appVersion"], adobe_plain["ecid"], adobe_plain["appVersionMH"],
+            adobe_plain["imsAPIKey"], adobe_plain["sessionGuid"], adobe_plain["systemManufacturer"],
+            adobe_plain["systemModel"], adobe_plain["userTimeZone"], adobe_plain["osVersion"], adobe_plain["osLocale"],
+            adobe_plain["mhLibVersion"], adobe_plain["stateName"], adobe_plain["hca"], adobe_plain["hcl"], adobe_plain["ham"],
+            adobe_enc_key_b64, adobe_enc_payload_b64
         ])
-
-    # --- STOP NETWORK MONITOR ---
-    if monitor_started:
-        stop_adobe_network_monitor()
 
     # --- UNINSTALL APK ---
     subprocess.run([adb_path, "uninstall", package_name])
