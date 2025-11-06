@@ -635,8 +635,7 @@ for apk_file in apk_folder.glob("*.apk"):
     else:
         login_status = "Success" if login_success else "Fail"
 
-    # --- Working STATUS ---
-# --- WORKING STATUS ---
+    # --- WORKING STATUS ---
     if installed_from_play == "Yes" and login_status == "Success":
         final_status = "Installed, working properly"
     elif install_status == "Success" and login_status == "Success":
@@ -653,90 +652,90 @@ for apk_file in apk_folder.glob("*.apk"):
     if monitor_started:
         stop_adobe_network_monitor()
     stop_frida_plaintext_sniffer()
-        # Parse only the new part of the log for this APK run
-        try:
-            def _flatten_adobe_json(obj: dict):
-                out = dict(adobe_plain)
-                try:
-                    out.update({
-                        "deviceGuid": obj.get("deviceGuid", ""),
-                        "userGuid": obj.get("userGuid", ""),
-                        "countryCode": obj.get("countryCode", ""),
-                        "appName": obj.get("appName", ""),
-                        "appId": obj.get("appId", ""),
-                        "appVersion": obj.get("appVersion", ""),
-                        "ecid": obj.get("ecid", ""),
-                        "appVersionMH": obj.get("appVersionMH", ""),
-                        "imsAPIKey": obj.get("imsAPIKey", ""),
-                        "sessionGuid": obj.get("sessionGuid", ""),
-                        "systemManufacturer": obj.get("systemManufacturer", ""),
-                        "systemModel": obj.get("systemModel", ""),
-                        "userTimeZone": obj.get("userTimeZone", ""),
-                        "osVersion": obj.get("osVersion", ""),
-                        "osLocale": obj.get("osLocale", ""),
-                        "mhLibVersion": obj.get("mhLibVersion", "")
-                    })
-                    state_list = obj.get("mAppStateList") or obj.get("appStateList") or []
-                    if isinstance(state_list, list) and len(state_list) > 0:
-                        state0 = state_list[0] or {}
-                        out["stateName"] = state0.get("stateName", "")
-                        svi = state0.get("stateValueInfo") or {}
-                        out["hca"] = svi.get("hca", "")
-                        out["hcl"] = svi.get("hcl", "")
-                        out["ham"] = svi.get("ham", "")
-                except Exception:
-                    pass
-                return out
+    # Parse only the new part of the log for this APK run
+    try:
+        def _flatten_adobe_json(obj: dict):
+            out = dict(adobe_plain)
+            try:
+                out.update({
+                    "deviceGuid": obj.get("deviceGuid", ""),
+                    "userGuid": obj.get("userGuid", ""),
+                    "countryCode": obj.get("countryCode", ""),
+                    "appName": obj.get("appName", ""),
+                    "appId": obj.get("appId", ""),
+                    "appVersion": obj.get("appVersion", ""),
+                    "ecid": obj.get("ecid", ""),
+                    "appVersionMH": obj.get("appVersionMH", ""),
+                    "imsAPIKey": obj.get("imsAPIKey", ""),
+                    "sessionGuid": obj.get("sessionGuid", ""),
+                    "systemManufacturer": obj.get("systemManufacturer", ""),
+                    "systemModel": obj.get("systemModel", ""),
+                    "userTimeZone": obj.get("userTimeZone", ""),
+                    "osVersion": obj.get("osVersion", ""),
+                    "osLocale": obj.get("osLocale", ""),
+                    "mhLibVersion": obj.get("mhLibVersion", "")
+                })
+                state_list = obj.get("mAppStateList") or obj.get("appStateList") or []
+                if isinstance(state_list, list) and len(state_list) > 0:
+                    state0 = state_list[0] or {}
+                    out["stateName"] = state0.get("stateName", "")
+                    svi = state0.get("stateValueInfo") or {}
+                    out["hca"] = svi.get("hca", "")
+                    out["hcl"] = svi.get("hcl", "")
+                    out["ham"] = svi.get("ham", "")
+            except Exception:
+                pass
+            return out
 
-            enc_key = ""
-            enc_payload = ""
-            plain_found = False
-            # Read only the appended part of the file
-            with open(adobe_net_log_file, "r", encoding="utf-8", errors="ignore") as lf:
-                try:
-                    lf.seek(log_start_offset)
-                except Exception:
-                    pass
-                for line in lf:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if line.startswith("FRIDA_PLAINTEXT:"):
-                        try:
-                            json_str = line.split(":", 1)[1]
-                            obj = json.loads(json_str)
-                            tmp = _flatten_adobe_json(obj)
-                            if tmp.get("deviceGuid") or tmp.get("sessionGuid"):
-                                adobe_plain = tmp
-                                plain_found = True
-                        except Exception:
-                            pass
-                    if line.startswith("JSON_REQ:") or line.startswith("JSON_RESP:"):
-                        try:
-                            json_str = line.split(":", 1)[1]
-                            obj = json.loads(json_str)
-                            tmp = _flatten_adobe_json(obj)
-                            # Consider it found if at least deviceGuid and sessionGuid exist
-                            if tmp.get("deviceGuid") or tmp.get("sessionGuid"):
-                                adobe_plain = tmp
-                                plain_found = True
-                        except Exception:
-                            pass
-                    elif line.startswith("ENC_REQ:"):
-                        try:
-                            json_str = line.split(":", 1)[1]
-                            obj = json.loads(json_str)
-                            if isinstance(obj, dict):
-                                enc_key = obj.get("key", enc_key)
-                                enc_payload = obj.get("payload", enc_payload)
-                        except Exception:
-                            pass
-            if enc_key:
-                adobe_enc_key_b64 = enc_key.strip()
-            if enc_payload:
-                adobe_enc_payload_b64 = enc_payload.strip()
-        except Exception as e:
-            log_msg(f"⚠️ Failed parsing adobe network log: {e}")
+        enc_key = ""
+        enc_payload = ""
+        plain_found = False
+        # Read only the appended part of the file
+        with open(adobe_net_log_file, "r", encoding="utf-8", errors="ignore") as lf:
+            try:
+                lf.seek(log_start_offset)
+            except Exception:
+                pass
+            for line in lf:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("FRIDA_PLAINTEXT:"):
+                    try:
+                        json_str = line.split(":", 1)[1]
+                        obj = json.loads(json_str)
+                        tmp = _flatten_adobe_json(obj)
+                        if tmp.get("deviceGuid") or tmp.get("sessionGuid"):
+                            adobe_plain = tmp
+                            plain_found = True
+                    except Exception:
+                        pass
+                if line.startswith("JSON_REQ:") or line.startswith("JSON_RESP:"):
+                    try:
+                        json_str = line.split(":", 1)[1]
+                        obj = json.loads(json_str)
+                        tmp = _flatten_adobe_json(obj)
+                        # Consider it found if at least deviceGuid and sessionGuid exist
+                        if tmp.get("deviceGuid") or tmp.get("sessionGuid"):
+                            adobe_plain = tmp
+                            plain_found = True
+                    except Exception:
+                        pass
+                elif line.startswith("ENC_REQ:"):
+                    try:
+                        json_str = line.split(":", 1)[1]
+                        obj = json.loads(json_str)
+                        if isinstance(obj, dict):
+                            enc_key = obj.get("key", enc_key)
+                            enc_payload = obj.get("payload", enc_payload)
+                    except Exception:
+                        pass
+        if enc_key:
+            adobe_enc_key_b64 = enc_key.strip()
+        if enc_payload:
+            adobe_enc_payload_b64 = enc_payload.strip()
+    except Exception as e:
+        log_msg(f"⚠️ Failed parsing adobe network log: {e}")
 
     # --- WRITE TO CSV ---
     with open(csv_file, "a", newline="", encoding="utf-8") as f:
