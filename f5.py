@@ -29,6 +29,9 @@ log_file = apk_folder / f"apk_run_{ts}.log"
 csv_file = apk_folder / f"apk_results.csv"
 adobe_net_log_file = apk_folder / f"adobe_network_{ts}.log"
 
+# Ensure output directory exists before any file operations
+apk_folder.mkdir(parents=True, exist_ok=True)
+
 # --- NETWORK MONITOR (mitmproxy over ADB reverse) ---
 mitm_proc = None
 frida_session = None
